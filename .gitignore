@@ -5,3 +5,5 @@ __pycache__/
 .env
 .env.*
 !.env.example
+group-settings.json
+.group-settings-*.tmp

@@ -16,9 +16,10 @@ from openai.types.responses import Response
 import bot
 
 
-async def check():
+async def check(settings_file):
     with patch.object(sys, "argv", ["bot.py",
-                                    "--telegram-token", "123:test", "--openrouter-api-key", "test"]):
+                                    "--telegram-token", "123:test", "--openrouter-api-key", "test",
+                                    "--settings-file", str(settings_file)]):
         args = bot.parse_args()
     assert args.model == "deepseek/deepseek-v4.1-flash"
     with tempfile.TemporaryDirectory() as directory:
@@ -137,6 +138,8 @@ async def check():
         await asyncio.gather(*tasks)
         assert stale.effective_message.reply_text.await_count == 0
         assert not runtime.chat(1).history, "Changing persona should remove the old conversation style"
+        assert settings_file.exists(), "A persona command must persist its override immediately"
+        assert json.loads(settings_file.read_text()) == {"1": {"persona": "Говори как пират"}}
 
         # An API failure must free the chat for the next request.
         await ingest(update(8, "бот ответь"))
@@ -204,6 +207,73 @@ async def check():
         finish(len(requests) - 1)
         await asyncio.gather(*tasks, return_exceptions=True)
         assert replacement.effective_message.reply_text.await_count == 1
+
+        # Settings outlive both cache eviction and a fresh application instance.
+        context.args = ["механик"]
+        await bot.on_trigger(update(19, "/trigger механик", chat_id=-100123), context)
+        assert runtime.chat(1).persona == "x" * 1000
+        assert runtime.chat(-100123).trigger_word == "механик"
+        restarted = bot.build_application(args)
+        restored = restarted.bot_data["runtime"]
+        await restored.client.close()
+        assert restored.chat(1).persona == "x" * 1000
+        assert restored.chat(-100123).trigger_word == "механик"
+        assert not restored.chat(1).history
+        context.application.bot_data["runtime"] = restored
+        context.args = ["Говори как механик"]
+        await bot.on_persona(update(20, "/persona", chat_id=-100123), context)
+        saved = settings_file.read_bytes()
+        assert json.loads(saved) == {
+            "1": {"persona": "x" * 1000},
+            "-100123": {"trigger_word": "механик", "persona": "Говори как механик"},
+        }, "Only overrides belong on disk; updating one group must preserve the others"
+
+        # A failed atomic replacement must preserve both disk and active settings.
+        state = restored.chat(-100123)
+        state.history.append(bot.ChatMessage("user", "Keep this conversation"))
+        revision = state.revision
+        with patch.object(bot.os, "replace", side_effect=OSError("disk failure")):
+            for number, handler, value in ((21, bot.on_persona, "Другой образ"),
+                                           (22, bot.on_trigger, "другой"),
+                                           (23, bot.on_persona, "reset"),
+                                           (24, bot.on_trigger, "reset")):
+                context.args = [value]
+                failed = update(number, "/command", chat_id=-100123)
+                await handler(failed, context)
+                assert "не удалось" in failed.effective_message.reply_text.call_args.args[0].lower()
+        assert settings_file.read_bytes() == saved
+        assert state.persona == "Говори как механик" and state.trigger_word == "механик"
+        assert state.revision == revision and state.history
+        assert list(settings_file.parent.iterdir()) == [settings_file], "Failed saves must clean up temporary files"
+
+        context.args = ["reset"]
+        await bot.on_persona(update(25, "/persona reset", chat_id=-100123), context)
+        assert json.loads(settings_file.read_text())["-100123"] == {"trigger_word": "механик"}
+        await bot.on_trigger(update(26, "/trigger reset", chat_id=-100123), context)
+        assert json.loads(settings_file.read_text()) == {"1": {"persona": "x" * 1000}}
+        args.default_persona = "Новый образ по умолчанию"
+        args.trigger_word = "робот"
+        restarted = bot.build_application(args)
+        restored = restarted.bot_data["runtime"]
+        await restored.client.close()
+        state = restored.chat(-100123)
+        assert (state.persona or restored.default_persona) == "Новый образ по умолчанию"
+        assert (state.trigger_word or restored.default_trigger_word) == "робот"
+
+        # Bad files must stop startup instead of silently discarding saved settings.
+        for invalid in ('{', '[]', '{"bad-id": {}}', '{"1": []}', '{"1": {"history": []}}',
+                        '{"1": {"persona": null}}', '{"1": {"persona": ""}}',
+                        '{"1": {"trigger_word": "two words"}}',
+                        json.dumps({"1": {"persona": "x" * 1001}}),
+                        json.dumps({"1": {"trigger_word": "x" * 65}})):
+            settings_file.write_text(invalid)
+            try:
+                bot.build_application(args)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Invalid settings were silently accepted")
+            assert settings_file.read_text() == invalid
     finally:
         for task in tasks:
             task.cancel()
@@ -217,7 +287,7 @@ async def check():
     assert len(bot.telegram_safe_text("слово " * 50)) <= 100
     for option, value in (("--auto-reply-cooldown", "nan"), ("--auto-reply-cooldown", "-1"),
                           ("--max-concurrent-requests", "0"), ("--max-output-tokens", "4097"),
-                          ("--max-prompt-chars", "1")):
+                          ("--max-prompt-chars", "1"), ("--settings-file", " ")):
         with patch.object(sys, "argv", ["bot.py", "--model", "test/model", "--telegram-token", "123:test",
                                         "--openrouter-api-key", "test", option, value]), redirect_stderr(io.StringIO()):
             try:
@@ -235,4 +305,5 @@ async def check():
 
 
 if __name__ == "__main__":
-    asyncio.run(check())
+    with tempfile.TemporaryDirectory() as directory:
+        asyncio.run(check(Path(directory) / "settings.json"))

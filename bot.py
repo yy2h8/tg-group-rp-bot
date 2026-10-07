@@ -18,6 +18,7 @@ import math
 import os
 import random
 import re
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
@@ -121,6 +122,8 @@ class Runtime:
     max_chats: int
     default_persona: str
     default_trigger_word: str
+    settings_file: str
+    group_overrides: dict[str, dict[str, str]]
     auto_reply_cooldown: float = 30
     request_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
     chats: dict[int, ChatState] = field(default_factory=dict)
@@ -136,9 +139,53 @@ class Runtime:
                 if evicted.reply_task is not None:
                     evicted.reply_task.cancel()
                 LOG.warning("Evicted chat state and pending reply for chat %s", evicted_id)
-            state = ChatState(history=deque(maxlen=self.history_limit))
+            overrides = self.group_overrides.get(str(chat_id), {})
+            state = ChatState(
+                history=deque(maxlen=self.history_limit),
+                persona=overrides.get("persona"),
+                trigger_word=overrides.get("trigger_word"),
+            )
         self.chats[chat_id] = state
         return state
+
+    def save_override(self, chat_id: int, name: str, value: str | None) -> bool:
+        updated = self.group_overrides.copy()
+        overrides = updated.get(str(chat_id), {}).copy()
+        if value is None:
+            overrides.pop(name, None)
+        else:
+            overrides[name] = value
+        if overrides:
+            updated[str(chat_id)] = overrides
+        else:
+            updated.pop(str(chat_id), None)
+
+        # ponytail: rewrite all overrides synchronously; use SQLite if writes become frequent.
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=os.path.dirname(self.settings_file),
+                prefix=".group-settings-", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary_path = stream.name
+                json.dump(updated, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, self.settings_file)
+        except (OSError, ValueError) as error:
+            LOG.error("Could not save group settings chat=%s error=%s", chat_id, type(error).__name__)
+            return False
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    LOG.warning("Could not remove settings temporary file error=%s", type(error).__name__)
+        self.group_overrides = updated
+        return True
 
     def mark_update(self, update_id: int) -> bool:
         if update_id in self.seen_updates:
@@ -232,6 +279,10 @@ def parse_args() -> argparse.Namespace:
         help="Default standalone trigger word (default: бот)",
     )
     parser.add_argument(
+        "--settings-file", default="group-settings.json",
+        help="JSON file for group persona and trigger overrides (default: ./group-settings.json)",
+    )
+    parser.add_argument(
         "--log-file",
         default="tg-group-rp-bot.log",
         help="Rotating log file path (default: ./tg-group-rp-bot.log)",
@@ -299,6 +350,8 @@ def parse_args() -> argparse.Namespace:
         )
     if not args.log_file.strip():
         parser.error("--log-file cannot be empty")
+    if not args.settings_file.strip():
+        parser.error("--settings-file cannot be empty")
     return args
 
 
@@ -311,6 +364,29 @@ def valid_trigger_word(word: str) -> bool:
         1 <= len(word) <= MAX_TRIGGER_WORD_CHARS
         and re.fullmatch(r"\w+", word, flags=re.UNICODE)
     )
+
+
+def load_group_overrides(path: str) -> dict[str, dict[str, str]]:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            overrides = json.load(stream)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(overrides, dict):
+        raise ValueError("Group settings must be a JSON object")
+    for chat_id, values in overrides.items():
+        if str(int(chat_id)) != chat_id or not isinstance(values, dict):
+            raise ValueError("Group settings must map chat IDs to objects")
+        if values.keys() - {"persona", "trigger_word"}:
+            raise ValueError("Group settings may only contain persona and trigger_word")
+        for name, value in values.items():
+            if not isinstance(value, str):
+                raise ValueError("Group overrides must be strings")
+            if name == "persona" and (not value.strip() or len(value) > MAX_PERSONA_CHARS):
+                raise ValueError("Invalid persona override")
+            if name == "trigger_word" and not valid_trigger_word(value):
+                raise ValueError("Invalid trigger override")
+    return overrides
 
 
 def contains_trigger_word(text: str, trigger: str) -> bool:
@@ -443,7 +519,11 @@ async def on_persona(
         return
 
     state = runtime.chat(chat.id)
-    state.persona = None if persona.casefold() == "reset" else persona
+    persona = None if persona.casefold() == "reset" else persona
+    if not runtime.save_override(chat.id, "persona", persona):
+        await message.reply_text("Не удалось сохранить настройки. Попробуй ещё раз позже.")
+        return
+    state.persona = persona
     state.revision += 1
     state.pending_reply = None
     state.history.clear()
@@ -469,22 +549,23 @@ async def on_trigger(
         trigger = state.trigger_word or runtime.default_trigger_word
         await message.reply_text(f"Триггер этого чата: {trigger}")
         return
-    if value.casefold() == "reset":
-        state.trigger_word = None
-        LOG.info("Group trigger reset to default for chat %s", chat.id)
-        await message.reply_text(
-            f"Триггер сброшен. Сейчас используется: {runtime.default_trigger_word}"
-        )
-        return
-    if not valid_trigger_word(value):
+    reset = value.casefold() == "reset"
+    if not reset and not valid_trigger_word(value):
         await message.reply_text(
             f"Укажи одно слово до {MAX_TRIGGER_WORD_CHARS} букв, цифр или знаков подчёркивания."
         )
         return
 
-    state.trigger_word = value
-    LOG.info("Group trigger changed for chat %s", chat.id)
-    await message.reply_text("Триггер группы обновлён.")
+    trigger = None if reset else value
+    if not runtime.save_override(chat.id, "trigger_word", trigger):
+        await message.reply_text("Не удалось сохранить настройки. Попробуй ещё раз позже.")
+        return
+    state.trigger_word = trigger
+    LOG.info("Group trigger %s for chat %s", "reset to default" if reset else "changed", chat.id)
+    await message.reply_text(
+        f"Триггер сброшен. Сейчас используется: {runtime.default_trigger_word}"
+        if reset else "Триггер группы обновлён."
+    )
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -672,6 +753,8 @@ async def close_client(application: Application) -> None:
 
 
 def build_application(args: argparse.Namespace) -> Application:
+    settings_file = os.path.abspath(args.settings_file)
+    group_overrides = load_group_overrides(settings_file)
     client = AsyncOpenAI(
         api_key=args.openrouter_api_key,
         base_url="https://openrouter.ai/api/v1",
@@ -693,6 +776,8 @@ def build_application(args: argparse.Namespace) -> Application:
         max_chats=args.max_chats,
         default_persona=args.default_persona.strip(),
         default_trigger_word=args.trigger_word,
+        settings_file=settings_file,
+        group_overrides=group_overrides,
     )
     application = (
         ApplicationBuilder()
@@ -749,7 +834,11 @@ def configure_logging(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     configure_logging(args)
-    application = build_application(args)
+    try:
+        application = build_application(args)
+    except (OSError, ValueError) as error:
+        LOG.error("Could not load group settings file=%s error=%s", args.settings_file, type(error).__name__)
+        raise SystemExit(1) from error
     try:
         application.run_polling(allowed_updates=["message"])
     except KeyboardInterrupt:
