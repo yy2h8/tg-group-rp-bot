@@ -58,7 +58,7 @@ uv run --locked --script bot.py \
   --trigger-word 'механик' \
   --auto-reply-probability 0.1 \
   --auto-reply-cooldown 60 \
-  --reasoning-effort low \
+  --reasoning-effort none \
   --temperature 0.7
 ```
 
@@ -71,8 +71,8 @@ uv run --locked --script bot.py \
 | `--auto-reply-cooldown` | `30` | Пауза в секундах перед случайными ответами; `0` отключает паузу |
 | `--history-limit` | `15` | Сколько сообщений хранить в группе, от 1 до 100 |
 | `--temperature` | `0.7` | Вариативность ответов, от 0 до 2; поддержка зависит от модели |
-| `--reasoning-effort` | `low` | Уровень рассуждений: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`; выберите поддерживаемый моделью |
-| `--max-output-tokens` | `128` | Бюджет генерации, от 1 до 4096 токенов; длина реплики в Telegram остаётся до 100 символов |
+| `--reasoning-effort` | `none` | Рассуждения отключены для коротких реплик. Также доступны `minimal`, `low`, `medium`, `high`, `xhigh`, если модель их поддерживает |
+| `--max-output-tokens` | `512` | Бюджет генерации, от 1 до 4096 токенов; длина реплики в Telegram остаётся до 100 символов |
 | `--max-concurrent-requests` | `4` | Число одновременных запросов к модели, от 1 до 32 |
 | `--max-message-chars` | `2000` | Сколько символов брать из входящего сообщения, от 1 до 4096 |
 | `--max-prompt-chars` | `16000` | Бюджет текста запроса, до 100000 символов; слишком маленькое значение отклоняется при запуске |
@@ -83,7 +83,7 @@ uv run --locked --script bot.py \
 
 Полная справка: `uv run --locked --script bot.py --help`.
 
-Если модель возвращает пустой ответ, проверьте запись `Empty model reply` в журнале. Рассуждения тоже расходуют бюджет генерации: попробуйте `--max-output-tokens 512` или отключите рассуждения через `--reasoning-effort none`, если модель это поддерживает. Увеличение бюджета может увеличить стоимость и время ответа. Подробнее — в [документации OpenRouter](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+Если модель возвращает пустой ответ, посмотрите полный журнал: `sudo journalctl -u tg-group-rp-bot -n 30 --no-pager -l`. Значения `status=incomplete` и `reason=max_output_tokens` означают, что бюджет генерации закончился. Рассуждения тоже расходуют этот бюджет: число потраченных на них токенов выводится как `reasoning_tokens`. Для DeepSeek оставьте `--reasoning-effort none --max-output-tokens 512`; проверьте, что старые значения `low` и `128` не остались в строке `ExecStart` или переопределениях systemd. Если вы намеренно включаете рассуждения, увеличьте бюджет, например до `--max-output-tokens 2048`. Это может увеличить стоимость и время ответа. Подробнее — в [документации OpenRouter](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
 
 ## Развёртывание на Linux с systemd
 

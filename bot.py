@@ -210,17 +210,17 @@ def parse_args() -> argparse.Namespace:
         help="Maximum Telegram updates waiting for processing (default: 100)",
     )
     parser.add_argument(
-        "--reasoning-effort", default="low",
+        "--reasoning-effort", default="none",
         choices=("none", "minimal", "low", "medium", "high", "xhigh"),
-        help="Reasoning effort supported by the selected model (default: low)",
+        help="Reasoning effort supported by the selected model (default: none)",
     )
     parser.add_argument(
         "--temperature", type=float, default=0.7,
         help="Sampling temperature (default: 0.7)",
     )
     parser.add_argument(
-        "--max-output-tokens", type=int, default=128,
-        help=f"Maximum generated tokens, including reasoning (default: 128; limit: {MAX_OUTPUT_TOKENS})",
+        "--max-output-tokens", type=int, default=512,
+        help=f"Maximum generated tokens, including reasoning (default: 512; limit: {MAX_OUTPUT_TOKENS})",
     )
     parser.add_argument(
         "--default-persona", default=DEFAULT_PERSONA,
@@ -329,6 +329,8 @@ def log_api_usage(response: Any, chat_id: int, model: str) -> None:
 
     input_tokens = usage_data.get("input_tokens", usage_data.get("prompt_tokens", "unknown"))
     output_tokens = usage_data.get("output_tokens", usage_data.get("completion_tokens", "unknown"))
+    output_details = usage_data.get("output_tokens_details") or usage_data.get("completion_tokens_details")
+    reasoning_tokens = output_details.get("reasoning_tokens", "unknown") if isinstance(output_details, dict) else "unknown"
     cost_details = usage_data.get("cost_details")
     cost = usage_data.get("cost", getattr(response, "cost", None))
     if cost is None and isinstance(cost_details, dict):
@@ -342,12 +344,13 @@ def log_api_usage(response: Any, chat_id: int, model: str) -> None:
             cost_text = "unavailable"
 
     LOG.info(
-        "OpenRouter usage chat=%s model=%s response_id=%s input_tokens=%s output_tokens=%s cost_usd=%s",
+        "OpenRouter usage input_tokens=%s output_tokens=%s reasoning_tokens=%s chat=%s model=%s response_id=%s cost_usd=%s",
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
         chat_id,
         model,
         getattr(response, "id", "unknown"),
-        input_tokens,
-        output_tokens,
         cost_text,
     )
     if cost_text == "unavailable":
@@ -621,9 +624,10 @@ async def generate_reply(
     reply = telegram_safe_text(raw_reply)
     if not reply:
         LOG.warning(
-            "Empty model reply chat=%s status=%s reason=%s; check reasoning and token budget",
-            chat.id, getattr(response, "status", "unknown"),
+            "Empty model reply status=%s reason=%s chat=%s reasoning_effort=%s max_output_tokens=%s",
+            getattr(response, "status", "unknown"),
             getattr(getattr(response, "incomplete_details", None), "reason", "unknown"),
+            chat.id, runtime.reasoning_effort, runtime.max_output_tokens,
         )
         return
     try:

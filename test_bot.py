@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from openai.types.responses import Response
+
 import bot
 
 
@@ -29,7 +31,9 @@ async def check():
         for handler in logging.getLogger().handlers[:]:
             handler.close()
             logging.getLogger().removeHandler(handler)
-    logging.disable(logging.CRITICAL)
+    diagnostics = io.StringIO()
+    log_handler = logging.StreamHandler(diagnostics)
+    bot.LOG.addHandler(log_handler)
 
     application = bot.build_application(args)
     runtime = application.bot_data["runtime"]
@@ -71,14 +75,27 @@ async def check():
         await asyncio.sleep(0)
 
     def finish(index, text="Привет!"):
-        pending_responses[index].set_result(SimpleNamespace(
-            output_text=text, usage=None, id="test", status="completed", incomplete_details=None,
-        ))
+        # Use the real SDK parser: reasoning-only output has no output_text.
+        response = Response.model_validate({
+            "id": "test", "created_at": 0, "model": "test/model", "object": "response",
+            "parallel_tool_calls": False, "tool_choice": "auto", "tools": [],
+            "status": "completed" if text else "incomplete",
+            "incomplete_details": None if text else {"reason": "max_output_tokens"},
+            "output": [{"type": "message", "id": "msg", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": text, "annotations": []}]}]
+                      if text else [{"type": "reasoning", "id": "rs", "summary": []}],
+            "usage": {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                      "output_tokens": 8 if text else 128, "total_tokens": 18 if text else 138,
+                      "output_tokens_details": {"reasoning_tokens": 0 if text else 128}},
+        })
+        pending_responses[index].set_result(response)
 
     first = update(1, "бот привет")
     try:
         await ingest(first)
         assert len(requests) == 1, "A model request should start without blocking updates"
+        assert requests[0]["reasoning"] == {"effort": "none"}, "Short replies must not spend their default budget thinking"
+        assert requests[0]["max_output_tokens"] >= 512, "The default response budget must leave room for visible text"
         await ingest(first)
         assert len(requests) == 1, "Duplicate Telegram updates must not generate twice"
 
@@ -172,6 +189,8 @@ async def check():
         finish(len(requests) - 1, "")
         await asyncio.gather(*tasks)
         assert runtime.chat(1).history[-1].role == "user", "Empty replies must not enter history"
+        assert "output_tokens=128 reasoning_tokens=128" in diagnostics.getvalue()
+        assert "Empty model reply status=incomplete reason=max_output_tokens" in diagnostics.getvalue()
 
         # Eviction must cancel active work and release the provider slot.
         runtime.chats.clear()
@@ -211,6 +230,7 @@ async def check():
                                     "OPENAI_API_KEY": "legacy-key"}, clear=True):
         with patch.object(sys, "argv", ["bot.py", "--model", "test/model", "--max-output-tokens", "512"]):
             assert bot.parse_args().openrouter_api_key == "router-key"
+    bot.LOG.removeHandler(log_handler)
     print("Offline regression check passed")
 
 

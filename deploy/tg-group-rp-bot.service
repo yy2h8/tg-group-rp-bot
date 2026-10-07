@@ -12,7 +12,7 @@ EnvironmentFile=/etc/tg-group-rp-bot.env
 Environment=UV_CACHE_DIR=/var/cache/tg-group-rp-bot
 Environment=UV_PYTHON_INSTALL_DIR=/var/lib/tg-group-rp-bot/python
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/local/bin/uv run --locked --script /opt/tg-group-rp-bot/bot.py --model deepseek/deepseek-v4.1-flash --log-file /var/log/tg-group-rp-bot/bot.log
+ExecStart=/usr/local/bin/uv run --locked --script /opt/tg-group-rp-bot/bot.py --model deepseek/deepseek-v4.1-flash --reasoning-effort none --max-output-tokens 512 --log-file /var/log/tg-group-rp-bot/bot.log
 StateDirectory=tg-group-rp-bot
 CacheDirectory=tg-group-rp-bot
 LogsDirectory=tg-group-rp-bot
