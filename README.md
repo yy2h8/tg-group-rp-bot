@@ -1,96 +1,128 @@
 # tg-group-rp-bot
 
-An asynchronous Telegram group bot that joins conversations in a configurable roleplay persona. It uses long polling, keeps bounded per-chat context in memory, and calls OpenRouter through the OpenAI SDK Responses API.
+Telegram-бот для групповых чатов: общается в заданном образе, помнит недавний разговор и отвечает короткими репликами до 100 символов. Ответы генерирует выбранная модель через OpenRouter. По умолчанию бот — дружелюбный, слегка остроумный участник беседы; образ можно менять прямо в группе.
 
-## Features
+## Запуск
 
-- Replies when users mention the bot, reply to it, or use the group trigger word as a whole word.
-- Uses `бот` as the default trigger. Any group member can run `/trigger <word>`, `/trigger`, or `/trigger reset`.
-- Replies to other group text with a configurable random chance. The default is 20%.
-- Lets any group member set a persona with `/persona <description>`.
-- Sends anonymized `User N` labels and selected message text to OpenRouter. It does not send Telegram IDs, names, or usernames.
-- Keeps history, aliases, personas, and trigger settings only in memory. A restart clears that state.
-- Limits replies to 100 characters and model generation to at most 128 tokens.
-- Bounds per-chat history, message length, prompt length, chat states, duplicate-update cache, and polling queue.
-- Logs operational errors, token usage, and returned request cost. Logs do not include message text or credentials.
+Понадобятся Python 3.10+, [uv](https://docs.astral.sh/uv/getting-started/installation/), токен Telegram-бота от [@BotFather](https://t.me/BotFather) и ключ [OpenRouter](https://openrouter.ai/settings/keys).
 
-## Requirements
-
-- Python 3.10 or newer
-- `uv`
-- A Telegram bot token
-- An OpenRouter API key and a model available to the key
-
-Dependencies are declared in the PEP 723 metadata at the top of `bot.py`. No virtual environment or project manifest is required.
-
-## Run
-
-Set credentials in the environment. The script accepts `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY` or explicit CLI arguments.
+Из каталога проекта выполните:
 
 ```sh
-export TELEGRAM_BOT_TOKEN='...'
-export OPENAI_API_KEY='...'
-uv run --script bot.py \
-  --model 'nvidia/nemotron-3-super-120b-a12b:free' \
-  --reasoning-effort low \
-  --temperature 1.2 \
-  --max-output-tokens 128 \
-  --trigger-word 'бот' \
-  --auto-reply-probability 0.2
+export TELEGRAM_BOT_TOKEN='токен Telegram'
+export OPENROUTER_API_KEY='ключ OpenRouter'
+
+uv run --locked --script bot.py
 ```
 
-Run `uv run --script bot.py --help` to view all options. Avoid passing credentials as CLI arguments on shared hosts. Shell history and process listings can expose CLI values.
+По умолчанию используется `deepseek/deepseek-v4.1-flash`. Чтобы выбрать другую модель, передайте `--model` с её идентификатором из [каталога OpenRouter](https://openrouter.ai/models). У ключа должен быть доступ к выбранной модели. `uv` установит зависимости из `bot.py.lock`; держите этот файл рядом с `bot.py`.
 
-To let the bot read regular group messages, disable Group Privacy in BotFather or grant the bot administrator access.
+Ключ OpenRouter также можно передать через `OPENAI_API_KEY` для совместимости со старым запуском. Если заданы обе переменные, используется `OPENROUTER_API_KEY`. Файл `.env` автоматически не читается; переменные нужно экспортировать в окружение. Ключи лучше не передавать аргументами командной строки.
 
-## systemd
+Добавьте бота в группу и разрешите ему отправку сообщений. Для чтения обычных реплик отключите Group Privacy через `/setprivacy` в BotFather, затем удалите и снова добавьте бота в группу. Бот с правами администратора также получает обычные сообщения. Подробнее — в [документации Telegram](https://core.telegram.org/bots/features#privacy-mode).
 
-`deploy/tg-group-rp-bot.service` is the service unit example used for deployment. It expects the `tg-group-rp-bot` system account and these directories:
+Проверить работу можно сообщением `бот привет` или упоминанием `@имя_бота`. В личных сообщениях бот не отвечает. Публичный сервер и webhook не нужны: сообщения забираются через long polling. Запускайте только один экземпляр с одним Telegram-токеном.
 
-- `/opt/tg-group-rp-bot/bot.py`
-- `/var/lib/tg-group-rp-bot`
-- `/var/cache/tg-group-rp-bot`
-- `/var/log/tg-group-rp-bot`
+## Как он работает
 
-Put `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY` in `/etc/tg-group-rp-bot.env`. Set the file owner to `root:root` and mode to `0600`. Install the script and service unit, then run:
+- Бот реагирует на упоминание, ответ на свою реплику и слово-триггер. По умолчанию это `бот`; регистр не важен, совпадения внутри слов вроде «работа» не учитываются.
+- На остальные текстовые сообщения отвечает с вероятностью 20%, если после последнего успешного ответа прошло хотя бы 30 секунд. Прямые обращения обходят эту паузу. Во время генерации случайные ответы не ставятся в очередь.
+- В контекст входят последние 15 сообщений участников и самого бота. Если участник отвечает на чужую реплику, передаётся также короткая цитата. При переполнении контекста отбрасываются самые старые сообщения.
+- Генерация идёт в фоне: разные группы могут получать ответы параллельно. В одной группе одновременно готовится один ответ; несколько новых обращений за это время объединяются в один следующий ответ на последнее обращение, с сохранением доступного контекста.
+- Обрабатывается текст; команды не передаются модели. Фото, голосовые сообщения и другие вложения не анализируются.
+
+История, образ и триггер хранятся только в памяти и сбрасываются при перезапуске. При достижении лимита групп освобождается состояние той, к которой обращались наиболее давно, включая её ожидающий ответ. Темы одной Telegram-группы используют общий контекст и настройки.
+
+В OpenRouter отправляются текст беседы и анонимные метки `User N`. Telegram ID, имена и usernames из полей профиля не добавляются в запрос. Сам текст сообщений и цитат не очищается от имён, ссылок и других сведений, которые написали участники.
+
+## Настройка в группе
+
+Команды доступны любому участнику:
+
+| Команда | Действие |
+| --- | --- |
+| `/persona Ты ворчливый, но добрый космический механик` | Задать образ бота для группы |
+| `/persona reset` | Вернуть образ из параметров запуска |
+| `/trigger` | Показать текущий триггер |
+| `/trigger механик` | Установить новое слово-триггер |
+| `/trigger reset` | Вернуть триггер из параметров запуска |
+
+Описание образа — до 1000 символов. При смене или сбросе образа история очищается, а результат старой генерации, ещё не переданный Telegram, отбрасывается. Триггер — одно слово до 64 символов: буквы, цифры или подчёркивание. `reset` зарезервирован для сброса.
+
+## Параметры запуска
+
+```sh
+uv run --locked --script bot.py \
+  --model 'deepseek/deepseek-v4.1-flash' \
+  --default-persona 'Ты ироничный космический механик. Отвечай одной короткой фразой.' \
+  --trigger-word 'механик' \
+  --auto-reply-probability 0.1 \
+  --auto-reply-cooldown 60 \
+  --reasoning-effort low \
+  --temperature 0.7
+```
+
+| Параметр | По умолчанию | Что меняет |
+| --- | --- | --- |
+| `--model` | `deepseek/deepseek-v4.1-flash` | Модель OpenRouter для генерации ответов |
+| `--default-persona` | Дружелюбный участник чата | Исходный образ для групп |
+| `--trigger-word` | `бот` | Исходное слово для обращения |
+| `--auto-reply-probability` | `0.2` | Вероятность случайного ответа; `0` — только по обращению |
+| `--auto-reply-cooldown` | `30` | Пауза в секундах перед случайными ответами; `0` отключает паузу |
+| `--history-limit` | `15` | Сколько сообщений хранить в группе, от 1 до 100 |
+| `--temperature` | `0.7` | Вариативность ответов, от 0 до 2; поддержка зависит от модели |
+| `--reasoning-effort` | `low` | Уровень рассуждений: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`; выберите поддерживаемый моделью |
+| `--max-output-tokens` | `128` | Бюджет генерации, от 1 до 4096 токенов; длина реплики в Telegram остаётся до 100 символов |
+| `--max-concurrent-requests` | `4` | Число одновременных запросов к модели, от 1 до 32 |
+| `--max-message-chars` | `2000` | Сколько символов брать из входящего сообщения, от 1 до 4096 |
+| `--max-prompt-chars` | `16000` | Бюджет текста запроса, до 100000 символов; слишком маленькое значение отклоняется при запуске |
+| `--max-chats` | `100` | Сколько групп держать в памяти, от 1 до 100 |
+| `--max-queued-updates` | `100` | Размер очереди входящих обновлений Telegram, от 1 до 1000 |
+| `--log-file` | `tg-group-rp-bot.log` | Путь к файлу журналов |
+| `--log-level` | `INFO` | Уровень журналов: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+Полная справка: `uv run --locked --script bot.py --help`.
+
+Если модель возвращает пустой ответ, проверьте запись `Empty model reply` в журнале. Рассуждения тоже расходуют бюджет генерации: попробуйте `--max-output-tokens 512` или отключите рассуждения через `--reasoning-effort none`, если модель это поддерживает. Увеличение бюджета может увеличить стоимость и время ответа. Подробнее — в [документации OpenRouter](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+
+## Развёртывание на Linux с systemd
+
+Установите `uv` в `/usr/local/bin/uv` или измените путь в [файле сервиса](deploy/tg-group-rp-bot.service). Он должен быть доступен служебному пользователю вне домашнего каталога. Следующие команды выполняются из каталога проекта на сервере с systemd:
+
+```sh
+sudo useradd --system --user-group --home-dir /var/lib/tg-group-rp-bot --shell /usr/sbin/nologin tg-group-rp-bot
+sudo install -d -m 0755 /opt/tg-group-rp-bot
+sudo install -m 0644 bot.py bot.py.lock /opt/tg-group-rp-bot/
+sudo install -m 0644 deploy/tg-group-rp-bot.service /etc/systemd/system/
+sudo install -m 0600 /dev/null /etc/tg-group-rp-bot.env
+sudoedit /etc/tg-group-rp-bot.env
+```
+
+Создание пользователя и пустого файла окружения нужно только при первой установке. В файл окружения запишите:
+
+```ini
+TELEGRAM_BOT_TOKEN=токен_Telegram
+OPENROUTER_API_KEY=ключ_OpenRouter
+```
+
+В `/etc/systemd/system/tg-group-rp-bot.service` при необходимости измените `--model` в строке `ExecStart` и добавьте параметры из таблицы выше. Затем запустите сервис:
 
 ```sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now tg-group-rp-bot
 sudo systemctl status tg-group-rp-bot
+sudo journalctl -u tg-group-rp-bot -f
 ```
 
-The service restarts after failures. It writes application logs to a rotating file and systemd journal. The file handler limits log files to 2 MiB, with three backups.
+systemd создаёт рабочий каталог `/var/lib/tg-group-rp-bot`, кеш `/var/cache/tg-group-rp-bot` и каталог журналов `/var/log/tg-group-rp-bot`. Сервис использует зависимости из lock-файла, перезапускается при падении и может установить подходящий Python через `uv`, если его нет на сервере. Для первого запуска нужен доступ в интернет.
 
-## Resource limits
-
-Defaults suit a few small groups. CLI options can tune the limits within hard caps.
-
-| Resource | Default | Hard cap |
-| --- | ---: | ---: |
-| Messages kept per chat | 15 | 100 |
-| Incoming message characters | 2,000 | 4,096 |
-| Prompt characters | 16,000 | 100,000 |
-| Chat states in memory | 100 | 100 |
-| Queued Telegram updates | 100 | 1,000 |
-| Generated tokens | 128 | 128 |
-| Sent reply characters | 100 | 100 |
-
-The bot evicts the least recently used chat state when its chat-state limit is reached. It keeps the newest messages that fit the prompt limit and logs the number of omitted messages and characters. It does not log message content.
-
-## Logging and recovery
-
-- OpenRouter requests use a 45-second timeout and retry up to two times.
-- Provider and Telegram errors are logged without response bodies. The process continues polling after a failed model request.
-- API usage logs include token counts and the reported USD cost. The cost can be unavailable if the provider does not return it.
-- The log file uses mode `0600`. HTTP client request logs are suppressed because Telegram request URLs contain the bot token.
-- A bounded in-memory update cache suppresses duplicate updates during one run. A restart clears the cache, so a crash near a reply can still cause a duplicate response.
-
-## Development
+Для обновления скопируйте новую версию скрипта и lock-файла, затем перезапустите сервис:
 
 ```sh
-uv run --script bot.py --help
-python3 -m py_compile bot.py
+sudo install -m 0644 bot.py bot.py.lock /opt/tg-group-rp-bot/
+sudo systemctl restart tg-group-rp-bot
 ```
 
-Automated tests are not part of this project by owner request.
+Если изменился файл сервиса, обновите его в `/etc/systemd/system/` и выполните `sudo systemctl daemon-reload` перед перезапуском. Настройки групп и история после перезапуска сбросятся.
+
+Журнал пишется в systemd journal и `/var/log/tg-group-rp-bot/bot.log`: ошибки, расход токенов и стоимость, если OpenRouter её вернул. Файл ротируется после 2 МиБ, сохраняются три предыдущих файла. Подробные логи SDK с содержимым запросов отключены, включая режим `DEBUG` бота. При временных ошибках OpenRouter выполняется один повтор; сетевой таймаут — 30 секунд. Неудачный или пустой ответ пропускается, бот продолжает работу.

@@ -10,8 +10,12 @@ Group=tg-group-rp-bot
 WorkingDirectory=/var/lib/tg-group-rp-bot
 EnvironmentFile=/etc/tg-group-rp-bot.env
 Environment=UV_CACHE_DIR=/var/cache/tg-group-rp-bot
+Environment=UV_PYTHON_INSTALL_DIR=/var/lib/tg-group-rp-bot/python
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/local/bin/uv run --script /opt/tg-group-rp-bot/bot.py --model nvidia/nemotron-3-super-120b-a12b:free --reasoning-effort low --temperature 1.2 --max-output-tokens 128 --trigger-word бот --log-file /var/log/tg-group-rp-bot/bot.log
+ExecStart=/usr/local/bin/uv run --locked --script /opt/tg-group-rp-bot/bot.py --model deepseek/deepseek-v4.1-flash --log-file /var/log/tg-group-rp-bot/bot.log
+StateDirectory=tg-group-rp-bot
+CacheDirectory=tg-group-rp-bot
+LogsDirectory=tg-group-rp-bot
 Restart=on-failure
 RestartSec=5s
 UMask=0077
@@ -19,7 +23,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/cache/tg-group-rp-bot /var/log/tg-group-rp-bot
 
 [Install]
 WantedBy=multi-user.target
