@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "openai>=1.68,<3",
-#   "python-telegram-bot>=22,<23",
+#   "httpx>=0.27,<1",
 # ]
 # ///
 """Async Telegram group roleplay bot. Run with: uv run --script bot.py --help"""
@@ -25,17 +25,8 @@ from logging.handlers import RotatingFileHandler
 from time import monotonic
 from typing import Any
 
+import httpx
 from openai import APIError, AsyncOpenAI
-from telegram import Message, MessageEntity, Update
-from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
 
 LOG = logging.getLogger("tg_group_rp_bot")
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
@@ -48,11 +39,12 @@ MAX_TRIGGER_WORD_CHARS = 64
 MAX_PERSONA_CHARS = 1000
 MAX_TELEGRAM_TEXT = 4096
 MAX_REPLY_CHARS = 100
+FALLBACK_REPLY = "gg"
 MAX_HISTORY_LIMIT = 100
 MAX_CHAT_STATES = 100
 MAX_PROMPT_CHARS = 100_000
 MAX_OUTPUT_TOKENS = 4096
-MAX_QUEUED_UPDATES = 1000
+LONG_POLL_SECONDS = 50
 DEDUPLICATION_WINDOW = 2048
 LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
 LOG_FILE_BACKUPS = 3
@@ -66,6 +58,10 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
         except OSError:
             pass
         return stream
+
+
+class TelegramApiError(Exception):
+    """Telegram returned {"ok": false}."""
 
 
 @dataclass(slots=True)
@@ -83,7 +79,7 @@ class ChatState:
     persona: str | None = None
     trigger_word: str | None = None
     reply_task: asyncio.Task[None] | None = None
-    pending_reply: tuple[Message, tuple[ChatMessage, ...]] | None = None
+    pending_reply: tuple[dict[str, Any], tuple[ChatMessage, ...]] | None = None
     revision: int = 0
     last_reply_at: float = -math.inf
 
@@ -110,6 +106,8 @@ class ChatState:
 
 @dataclass(slots=True)
 class Runtime:
+    telegram_token: str
+    http: httpx.AsyncClient
     client: AsyncOpenAI
     model: str
     reasoning_effort: str
@@ -129,6 +127,8 @@ class Runtime:
     chats: dict[int, ChatState] = field(default_factory=dict)
     seen_updates: set[int] = field(default_factory=set)
     update_order: deque[int] = field(default_factory=deque)
+    bot_id: int = 0
+    bot_username: str = ""
 
     def chat(self, chat_id: int) -> ChatState:
         state = self.chats.pop(chat_id, None)
@@ -198,6 +198,22 @@ class Runtime:
         return True
 
 
+async def telegram_call(runtime: Runtime, method: str, payload: dict[str, Any]) -> Any:
+    response = await runtime.http.post(
+        f"https://api.telegram.org/bot{runtime.telegram_token}/{method}", json=payload
+    )
+    data = response.json()
+    if not data.get("ok"):
+        raise TelegramApiError(data.get("description", "unknown error"))
+    return data["result"]
+
+
+def entity_text(text: str, offset: int, length: int) -> str:
+    # ponytail: Telegram entity offsets are UTF-16 code units; convert via bytes.
+    encoded = text.encode("utf-16-le")
+    return encoded[2 * offset : 2 * (offset + length)].decode("utf-16-le")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Roleplay bot for Telegram group chats using OpenRouter."
@@ -249,12 +265,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Maximum chat states kept in memory (default: 100)",
-    )
-    parser.add_argument(
-        "--max-queued-updates",
-        type=int,
-        default=100,
-        help="Maximum Telegram updates waiting for processing (default: 100)",
     )
     parser.add_argument(
         "--reasoning-effort", default="none",
@@ -315,10 +325,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-message-chars must be between 1 and 4096")
     if not 1 <= args.max_chats <= MAX_CHAT_STATES:
         parser.error(f"--max-chats must be between 1 and {MAX_CHAT_STATES}")
-    if not 1 <= args.max_queued_updates <= MAX_QUEUED_UPDATES:
-        parser.error(
-            f"--max-queued-updates must be between 1 and {MAX_QUEUED_UPDATES}"
-        )
     if args.max_prompt_chars > MAX_PROMPT_CHARS:
         parser.error(f"--max-prompt-chars cannot exceed {MAX_PROMPT_CHARS}")
     if args.max_output_tokens > MAX_OUTPUT_TOKENS:
@@ -355,8 +361,8 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def is_group_message(message: Message) -> bool:
-    return message.chat.type in ("group", "supergroup")
+def is_group_message(message: dict[str, Any]) -> bool:
+    return message["chat"]["type"] in ("group", "supergroup")
 
 
 def valid_trigger_word(word: str) -> bool:
@@ -437,15 +443,15 @@ def log_api_usage(response: Any, chat_id: int, model: str) -> None:
         )
 
 
-def mentions_bot(message: Message, bot_id: int, bot_username: str) -> bool:
-    for entity in message.entities or ():
-        if entity.type == MessageEntity.TEXT_MENTION and entity.user and entity.user.id == bot_id:
+def mentions_bot(message: dict[str, Any], bot_id: int, bot_username: str) -> bool:
+    for entity in message.get("entities") or ():
+        if entity["type"] == "text_mention" and (entity.get("user") or {}).get("id") == bot_id:
             return True
-        if entity.type == MessageEntity.MENTION:
-            if message.parse_entity(entity).casefold() == f"@{bot_username}".casefold():
+        if entity["type"] == "mention":
+            if entity_text(message["text"], entity["offset"], entity["length"]).casefold() == f"@{bot_username}".casefold():
                 return True
-    reply = message.reply_to_message
-    return bool(reply and reply.from_user and reply.from_user.id == bot_id)
+    reply = message.get("reply_to_message")
+    return bool(reply and (reply.get("from") or {}).get("id") == bot_id)
 
 
 def system_instructions(persona: str) -> str:
@@ -501,123 +507,146 @@ def telegram_safe_text(text: str) -> str:
     return prefix + "…"
 
 
-async def on_persona(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None or not is_group_message(message):
-        return
+def parse_command(text: str, bot_username: str) -> tuple[str, list[str]] | None:
+    match = re.match(r"/(\w+)(?:@(\w+))?(?:\s|$)", text)
+    if match is None:
+        return None
+    addressee = match.group(2)
+    if addressee and addressee.casefold() != bot_username.casefold():
+        return None  # command aimed at another bot
+    return match.group(1).lower(), text.split()[1:]
 
-    runtime: Runtime = context.application.bot_data["runtime"]
-    if update.update_id is not None and not runtime.mark_update(update.update_id):
+
+async def handle_update(runtime: Runtime, update: dict[str, Any]) -> None:
+    if not runtime.mark_update(update["update_id"]):
         return
-    persona = " ".join(context.args).strip()
+    message = update.get("message")
+    text = (message or {}).get("text")
+    if not message or not text:
+        return
+    command = parse_command(text, runtime.bot_username)
+    if command is not None:
+        name, args = command
+        if name == "persona":
+            await on_persona(runtime, message, args)
+        elif name == "trigger":
+            await on_trigger(runtime, message, args)
+        return  # commands, known or not, never reach the model
+    await on_message(runtime, message)
+
+
+async def on_persona(runtime: Runtime, message: dict[str, Any], args: list[str]) -> None:
+    if not is_group_message(message):
+        return
+    chat_id = message["chat"]["id"]
+    persona = " ".join(args).strip()
     if not persona:
-        await message.reply_text("Укажи образ: /persona <описание>. Сброс: /persona reset")
+        await telegram_call(runtime, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "Укажи образ: /persona <описание>. Сброс: /persona reset",
+        })
         return
     if len(persona) > MAX_PERSONA_CHARS:
-        await message.reply_text(
-            f"Описание образа слишком длинное. Максимум — {MAX_PERSONA_CHARS} символов."
-        )
+        await telegram_call(runtime, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"Описание образа слишком длинное. Максимум — {MAX_PERSONA_CHARS} символов.",
+        })
         return
 
-    state = runtime.chat(chat.id)
+    state = runtime.chat(chat_id)
     persona = None if persona.casefold() == "reset" else persona
-    if not runtime.save_override(chat.id, "persona", persona):
-        await message.reply_text("Не удалось сохранить настройки. Попробуй ещё раз позже.")
+    if not runtime.save_override(chat_id, "persona", persona):
+        await telegram_call(runtime, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "Не удалось сохранить настройки. Попробуй ещё раз позже.",
+        })
         return
     state.persona = persona
     state.revision += 1
     state.pending_reply = None
     state.history.clear()
     state.user_aliases.clear()
-    await message.reply_text("Образ группы обновлён. Контекст очищен.")
+    await telegram_call(runtime, "sendMessage", {
+        "chat_id": chat_id,
+        "text": "Образ группы обновлён. Контекст очищен.",
+    })
 
 
-async def on_trigger(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None or not is_group_message(message):
+async def on_trigger(runtime: Runtime, message: dict[str, Any], args: list[str]) -> None:
+    if not is_group_message(message):
         return
-
-    runtime: Runtime = context.application.bot_data["runtime"]
-    if update.update_id is not None and not runtime.mark_update(update.update_id):
-        return
-
-    value = " ".join(context.args).strip()
-    state = runtime.chat(chat.id)
+    chat_id = message["chat"]["id"]
+    value = " ".join(args).strip()
+    state = runtime.chat(chat_id)
     if not value:
         trigger = state.trigger_word or runtime.default_trigger_word
-        await message.reply_text(f"Триггер этого чата: {trigger}")
+        await telegram_call(runtime, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"Триггер этого чата: {trigger}",
+        })
         return
     reset = value.casefold() == "reset"
     if not reset and not valid_trigger_word(value):
-        await message.reply_text(
-            f"Укажи одно слово до {MAX_TRIGGER_WORD_CHARS} букв, цифр или знаков подчёркивания."
-        )
+        await telegram_call(runtime, "sendMessage", {
+            "chat_id": chat_id,
+            "text": f"Укажи одно слово до {MAX_TRIGGER_WORD_CHARS} букв, цифр или знаков подчёркивания.",
+        })
         return
 
     trigger = None if reset else value
-    if not runtime.save_override(chat.id, "trigger_word", trigger):
-        await message.reply_text("Не удалось сохранить настройки. Попробуй ещё раз позже.")
+    if not runtime.save_override(chat_id, "trigger_word", trigger):
+        await telegram_call(runtime, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "Не удалось сохранить настройки. Попробуй ещё раз позже.",
+        })
         return
     state.trigger_word = trigger
-    LOG.info("Group trigger %s for chat %s", "reset to default" if reset else "changed", chat.id)
-    await message.reply_text(
-        f"Триггер сброшен. Сейчас используется: {runtime.default_trigger_word}"
-        if reset else "Триггер группы обновлён."
-    )
+    LOG.info("Group trigger %s for chat %s", "reset to default" if reset else "changed", chat_id)
+    await telegram_call(runtime, "sendMessage", {
+        "chat_id": chat_id,
+        "text": (
+            f"Триггер сброшен. Сейчас используется: {runtime.default_trigger_word}"
+            if reset else "Триггер группы обновлён."
+        ),
+    })
 
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.update_id is None:
-        return
-    runtime: Runtime = context.application.bot_data["runtime"]
-    if not runtime.mark_update(update.update_id):
-        return
-
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
+async def on_message(runtime: Runtime, message: dict[str, Any]) -> None:
+    user = message.get("from")
     if (
-        message is None
-        or chat is None
-        or user is None
-        or message.text is None
+        user is None
+        or message.get("text") is None
         or not is_group_message(message)
-        or (user.is_bot and message.sender_chat is None)
+        or (user.get("is_bot") and not message.get("sender_chat"))
     ):
         return
 
-    state = runtime.chat(chat.id)
-    alias = state.alias_for(message.sender_chat.id if message.sender_chat else user.id)
+    chat_id = message["chat"]["id"]
+    state = runtime.chat(chat_id)
+    alias = state.alias_for(message["sender_chat"]["id"] if message.get("sender_chat") else user["id"])
     trigger_word = state.trigger_word or runtime.default_trigger_word
-    trigger_detected = contains_trigger_word(message.text, trigger_word)
-    text = message.text
+    trigger_detected = contains_trigger_word(message["text"], trigger_word)
+    text = message["text"]
     if len(text) > runtime.max_message_chars:
         LOG.warning(
             "Truncated incoming message in chat %s from %d to %d chars",
-            chat.id,
+            chat_id,
             len(text),
             runtime.max_message_chars,
         )
         text = text[: runtime.max_message_chars - 1].rstrip() + "…"
     content = {"speaker": alias, "text": text}
-    quoted = message.reply_to_message
-    if quoted and (quoted.text or quoted.caption):
+    quoted = message.get("reply_to_message")
+    if quoted and (quoted.get("text") or quoted.get("caption")):
         content["reply_to"] = {
-            "speaker": "bot" if quoted.from_user and quoted.from_user.id == context.bot.id else "participant",
-            "text": (quoted.text or quoted.caption)[:200],
+            "speaker": "bot" if (quoted.get("from") or {}).get("id") == runtime.bot_id else "participant",
+            "text": (quoted.get("text") or quoted.get("caption"))[:200],
         }
     state.history.append(ChatMessage("user", json.dumps(content, ensure_ascii=False), alias))
     state.prune_aliases()
 
-    bot_username = context.application.bot_data["bot_username"]
     forced_reply = (
-        mentions_bot(message, context.bot.id, bot_username)
+        mentions_bot(message, runtime.bot_id, runtime.bot_username)
         or trigger_detected
     )
     if not forced_reply:
@@ -632,9 +661,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # if every trigger in a burst must receive a separate response.
     state.pending_reply = (message, tuple(state.history))
     if state.reply_task is None:
-        state.reply_task = context.application.create_task(
-            reply_to_chat(runtime, state), update=update,
-        )
+        state.reply_task = asyncio.create_task(reply_to_chat(runtime, state))
 
 
 async def reply_to_chat(runtime: Runtime, state: ChatState) -> None:
@@ -650,10 +677,31 @@ async def reply_to_chat(runtime: Runtime, state: ChatState) -> None:
         state.reply_task = None
 
 
-async def generate_reply(
-    runtime: Runtime, state: ChatState, message: Message, history: tuple[ChatMessage, ...]
+async def send_reply(runtime: Runtime, chat_id: int, message_id: int, text: str) -> None:
+    await telegram_call(runtime, "sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_parameters": {"message_id": message_id, "allow_sending_without_reply": True},
+    })
+
+
+async def send_fallback_reply(
+    runtime: Runtime, state: ChatState, message: dict[str, Any], revision: int
 ) -> None:
-    chat = message.chat
+    if revision != state.revision:
+        return
+    try:
+        await send_reply(runtime, message["chat"]["id"], message["message_id"], FALLBACK_REPLY)
+    except (TelegramApiError, httpx.HTTPError) as error:
+        LOG.warning("Fallback reply failed chat=%s error=%s", message["chat"]["id"], type(error).__name__)
+    except Exception as error:
+        LOG.error("Unexpected fallback reply failure chat=%s error=%s", message["chat"]["id"], type(error).__name__)
+
+
+async def generate_reply(
+    runtime: Runtime, state: ChatState, message: dict[str, Any], history: tuple[ChatMessage, ...]
+) -> None:
+    chat_id = message["chat"]["id"]
     revision = state.revision
 
     persona = state.persona or runtime.default_persona
@@ -663,7 +711,7 @@ async def generate_reply(
     if dropped_messages:
         LOG.warning(
             "Trimmed prompt context in chat %s: omitted %d messages and %d chars",
-            chat.id,
+            chat_id,
             dropped_messages,
             dropped_chars,
         )
@@ -681,28 +729,30 @@ async def generate_reply(
         request_id = getattr(error, "request_id", None) or "unknown"
         LOG.warning(
             "OpenRouter request failed chat=%s error=%s status=%s request_id=%s",
-            chat.id,
+            chat_id,
             type(error).__name__,
             status,
             request_id,
         )
+        await send_fallback_reply(runtime, state, message, revision)
         return
     except Exception as error:
         LOG.error(
             "Unexpected model client failure chat=%s error=%s",
-            chat.id,
+            chat_id,
             type(error).__name__,
         )
+        await send_fallback_reply(runtime, state, message, revision)
         return
 
-    log_api_usage(response, chat.id, runtime.model)
+    log_api_usage(response, chat_id, runtime.model)
     if revision != state.revision:
         return
     raw_reply = (response.output_text or "").strip()
     if len(raw_reply) > MAX_REPLY_CHARS:
         LOG.warning(
             "Truncated model reply in chat %s from %d to %d chars",
-            chat.id,
+            chat_id,
             len(raw_reply),
             MAX_REPLY_CHARS,
         )
@@ -712,24 +762,27 @@ async def generate_reply(
             "Empty model reply status=%s reason=%s chat=%s reasoning_effort=%s max_output_tokens=%s",
             getattr(response, "status", "unknown"),
             getattr(getattr(response, "incomplete_details", None), "reason", "unknown"),
-            chat.id, runtime.reasoning_effort, runtime.max_output_tokens,
+            chat_id, runtime.reasoning_effort, runtime.max_output_tokens,
         )
+        await send_fallback_reply(runtime, state, message, revision)
         return
     try:
-        await message.reply_text(reply, do_quote=True, allow_sending_without_reply=True)
-    except TelegramError as error:
+        await send_reply(runtime, chat_id, message["message_id"], reply)
+    except (TelegramApiError, httpx.HTTPError) as error:
         LOG.warning(
             "Telegram reply failed chat=%s error=%s",
-            chat.id,
+            chat_id,
             type(error).__name__,
         )
+        await send_fallback_reply(runtime, state, message, revision)
         return
     except Exception as error:
         LOG.error(
             "Unexpected Telegram client failure chat=%s error=%s",
-            chat.id,
+            chat_id,
             type(error).__name__,
         )
+        await send_fallback_reply(runtime, state, message, revision)
         return
     state.last_reply_at = monotonic()
     if revision == state.revision:
@@ -737,26 +790,7 @@ async def generate_reply(
         state.prune_aliases()
 
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    error = context.error
-    update_id = getattr(update, "update_id", "unknown")
-    LOG.error(
-        "Unhandled update failure update_id=%s error=%s",
-        update_id,
-        type(error).__name__ if error else "unknown",
-    )
-
-
-async def initialize(application: Application) -> None:
-    application.bot_data["bot_username"] = application.bot.username or ""
-
-
-async def close_client(application: Application) -> None:
-    runtime: Runtime = application.bot_data["runtime"]
-    await runtime.client.close()
-
-
-def build_application(args: argparse.Namespace) -> Application:
+def build_runtime(args: argparse.Namespace) -> Runtime:
     settings_file = os.path.abspath(args.settings_file)
     group_overrides = load_group_overrides(settings_file)
     client = AsyncOpenAI(
@@ -765,7 +799,11 @@ def build_application(args: argparse.Namespace) -> Application:
         timeout=30.0,
         max_retries=1,
     )
-    runtime = Runtime(
+    return Runtime(
+        telegram_token=args.telegram_token,
+        http=httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=LONG_POLL_SECONDS + 20, write=10, pool=10)
+        ),
         client=client,
         model=args.model,
         reasoning_effort=args.reasoning_effort,
@@ -783,22 +821,33 @@ def build_application(args: argparse.Namespace) -> Application:
         settings_file=settings_file,
         group_overrides=group_overrides,
     )
-    application = (
-        ApplicationBuilder()
-        .token(args.telegram_token)
-        .update_queue(asyncio.Queue(maxsize=args.max_queued_updates))
-        .post_init(initialize)
-        .post_shutdown(close_client)
-        .build()
-    )
-    application.bot_data["runtime"] = runtime
-    application.add_handler(CommandHandler("persona", on_persona))
-    application.add_handler(CommandHandler("trigger", on_trigger))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, on_message)
-    )
-    application.add_error_handler(on_error)
-    return application
+
+
+async def run_bot(runtime: Runtime) -> None:
+    try:
+        me = await telegram_call(runtime, "getMe", {})
+        runtime.bot_id, runtime.bot_username = me["id"], me.get("username") or ""
+        LOG.info("Started as @%s", runtime.bot_username)
+        offset = 0
+        while True:
+            try:
+                updates = await telegram_call(runtime, "getUpdates", {
+                    "offset": offset, "timeout": LONG_POLL_SECONDS, "allowed_updates": ["message"],
+                })
+            except (TelegramApiError, httpx.HTTPError) as error:
+                LOG.warning("getUpdates failed error=%s; retrying", type(error).__name__)
+                await asyncio.sleep(3)
+                continue
+            for update in updates:
+                offset = update["update_id"] + 1
+                try:
+                    await handle_update(runtime, update)
+                except Exception as error:
+                    LOG.error("Unhandled update failure update_id=%s error=%s",
+                              update["update_id"], type(error).__name__)
+    finally:
+        await runtime.http.aclose()
+        await runtime.client.close()
 
 
 def configure_logging(args: argparse.Namespace) -> None:
@@ -831,7 +880,7 @@ def configure_logging(args: argparse.Namespace) -> None:
         force=True,
     )
     # SDK debug logs contain credentials, request bodies, and Telegram updates.
-    for name in ("httpx", "httpcore", "openai", "telegram"):
+    for name in ("httpx", "httpcore", "openai"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
@@ -839,12 +888,12 @@ def main() -> None:
     args = parse_args()
     configure_logging(args)
     try:
-        application = build_application(args)
+        runtime = build_runtime(args)
     except (OSError, ValueError) as error:
         LOG.error("Could not load group settings file=%s error=%s", args.settings_file, type(error).__name__)
         raise SystemExit(1) from error
     try:
-        application.run_polling(allowed_updates=["message"])
+        asyncio.run(run_bot(runtime))
     except KeyboardInterrupt:
         LOG.info("Shutdown requested")
 
