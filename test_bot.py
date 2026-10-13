@@ -41,6 +41,9 @@ async def check(settings_file):
                                     "--settings-file", str(settings_file)]):
         args = bot.parse_args()
     assert args.model == "deepseek/deepseek-v4.1-flash"
+    assert args.default_persona == bot.DEFAULT_PERSONA
+    assert len(args.default_persona) <= bot.MAX_PERSONA_CHARS
+    assert args.default_persona.endswith("Отвечаешь только цитатами.")
     with tempfile.TemporaryDirectory() as directory:
         args.log_file = str(Path(directory) / "bot.log")
         args.log_level = "DEBUG"
